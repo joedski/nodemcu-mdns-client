@@ -218,11 +218,15 @@ function query(service, timeout,own_ip,callback)
     -- collect responses until timeout
     local answers = { srv = {}, a = {}, aaaa = {}, ptr = {} }
     udpSocket:on("receive", function(s, data, port, ip)
-        print(string.format("received '%s' from %s:%d", data, ip, port))
+        -- print(string.format("received '%s' from %s:%d", data, ip, port))
+        print(string.format("received %s bytes from %s:%d", #data, ip, port))
         if data and (port == mdns_port) then
             mdns_parse(service, data, answers)
             if (browse) then
+                print("Sending "..#answers.ptr.." queries...")
                 for _, ptr in ipairs(answers.ptr) do
+                    -- getting an error here: PANIC: unprotected error in call to Lua API (mdnsclient.lua:228: unknown error)
+                    -- Maybe it's trying to spam :send too quickly?
                     s:send(mdns_port, mdns_multicast_ip, mdns_make_query(ptr))
                 end
                 answers.ptr = {}
@@ -234,7 +238,7 @@ function query(service, timeout,own_ip,callback)
     local mdns_query = mdns_make_query(service)
     udpSocket:send(mdns_port, mdns_multicast_ip,mdns_query)
 
-    tmr.alarm(0,timeout*1000,tmr.ALARM_SINGLE, function()
+    function onTimeout()
         --once the timer is over, cleanup thesockets and collect the results
         udpSocket:close()
         net.multicastLeave(own_ip,mdns_multicast_ip)
@@ -270,7 +274,17 @@ function query(service, timeout,own_ip,callback)
             end
         end
         node.task.post(createCallbackWithArgs(nil,services))
-    end)
+    end
+
+    if not tmr.create():alarm(timeout*1000, tmr.ALARM_SINGLE, onTimeout) then
+        -- If we can't create the timer, bail.
+        udpSocket:close()
+        net.multicastLeave(own_ip,mdns_multicast_ip)
+        node.task.post(createCallbackWithArgs('Could not create alarm',nil))
+    end
+    -- I could've sworn that tmr.alarm used to be a thing?
+    -- But I can't see it mentioned anywhere.
+    -- tmr.alarm(0,timeout*1000,tmr.ALARM_SINGLE, onTimeout)
 end
 
 -- query results and 1 based index to identify the result to return when there are more than one matches
