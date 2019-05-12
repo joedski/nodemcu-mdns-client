@@ -172,6 +172,47 @@ local function mdns_parse(service, data, answers)
     return answers
 end
 
+local socketMessageQueue = {
+    s = nil,
+    queue = nil,
+    isSendPending = false,
+    init = function(self, s)
+        self.s = s
+        self.queue = {}
+        self.s:on('sent', function()
+            self:onMessageSent()
+        end)
+    end,
+    deinit = function(self)
+        self.s = nil
+        self.queue = nil
+    end,
+    push = function(self, port, target, message)
+        table.insert(self.queue, {
+            port = port,
+            target = target,
+            message = message
+        })
+        self:send()
+    end,
+    send = function(self)
+        if not self.isSendPending and #self.queue > 0 then
+            self.isSendPending = true
+            local nextMessage = table.remove(self.queue, 1)
+            self.s:send(
+                nextMessage.port,
+                nextMessage.target,
+                nextMessage.message
+            )
+        end
+    end,
+    onMessageSent = function(self)
+        self.isSendPending = false
+        if #self.queue > 0 then
+            self:send()
+        end
+    end
+}
 
 --- Locate MDNS services in local network
 --
@@ -215,6 +256,7 @@ function query(service, timeout,own_ip,callback)
     local mdns_multicast_ip, mdns_port = '224.0.0.251', 5353
     net.multicastJoin(own_ip, mdns_multicast_ip)
     udpSocket = net.createUDPSocket()
+    socketMessageQueue:init(udpSocket)
     -- collect responses until timeout
     local answers = { srv = {}, a = {}, aaaa = {}, ptr = {} }
     udpSocket:on("receive", function(s, data, port, ip)
@@ -223,11 +265,13 @@ function query(service, timeout,own_ip,callback)
         if data and (port == mdns_port) then
             mdns_parse(service, data, answers)
             if (browse) then
-                print("Sending "..#answers.ptr.." queries...")
+                print("Sending "..#answers.ptr.." queries:")
                 for _, ptr in ipairs(answers.ptr) do
+                    print("  -> "..ptr)
                     -- getting an error here: PANIC: unprotected error in call to Lua API (mdnsclient.lua:228: unknown error)
                     -- Maybe it's trying to spam :send too quickly?
-                    s:send(mdns_port, mdns_multicast_ip, mdns_make_query(ptr))
+                    -- s:send(mdns_port, mdns_multicast_ip, mdns_make_query(ptr))
+                    socketMessageQueue:push(mdns_port, mdns_multicast_ip, mdns_make_query(ptr))
                 end
                 answers.ptr = {}
             end
@@ -236,15 +280,19 @@ function query(service, timeout,own_ip,callback)
     udpSocket:listen()
     port, ip = udpSocket:getaddr()
     local mdns_query = mdns_make_query(service)
-    udpSocket:send(mdns_port, mdns_multicast_ip,mdns_query)
+    -- udpSocket:send(mdns_port, mdns_multicast_ip,mdns_query)
+    socketMessageQueue:push(mdns_port, mdns_multicast_ip, mdns_query)
 
     function onTimeout()
         --once the timer is over, cleanup thesockets and collect the results
+        socketMessageQueue:deinit()
         udpSocket:close()
         net.multicastLeave(own_ip,mdns_multicast_ip)
 
         local services = {}
+        print("Got "..#answers.srv.." service entries...")
         for k,v in pairs(answers.srv) do
+            print("  Processing  "..k.."  "..v.target.."  "..v.port)
             local pos = k:find('%.')
             if (pos and (pos > 1) and (pos < #k)) then
                 local name, svc = k:sub(1, pos - 1), k:sub(pos + 1)
@@ -278,6 +326,7 @@ function query(service, timeout,own_ip,callback)
 
     if not tmr.create():alarm(timeout*1000, tmr.ALARM_SINGLE, onTimeout) then
         -- If we can't create the timer, bail.
+        socketMessageQueue.deinit()
         udpSocket:close()
         net.multicastLeave(own_ip,mdns_multicast_ip)
         node.task.post(createCallbackWithArgs('Could not create alarm',nil))
